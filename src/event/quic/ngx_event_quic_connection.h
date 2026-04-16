@@ -200,6 +200,9 @@ typedef struct {
 #if (NGX_DEBUG)
 typedef struct {
     ngx_uint_t                        loss_declared;
+    ngx_uint_t                        reclaimed_frames;
+    ngx_uint_t                        ping_probes;
+    ngx_uint_t                        spurious_loss_suspects;
 } ngx_quic_counters_t;
 #endif
 
@@ -234,6 +237,7 @@ struct ngx_quic_send_ctx_s {
     ngx_uint_t                        nranges;
     ngx_quic_ack_range_t              ranges[NGX_QUIC_MAX_RANGES];
     ngx_uint_t                        send_ack;
+    ngx_uint_t                        probe_pending;
 };
 
 
