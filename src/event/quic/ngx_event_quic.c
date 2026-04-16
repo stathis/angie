@@ -1071,9 +1071,13 @@ ngx_quic_close_connection(ngx_connection_t *c, ngx_int_t rc)
     ngx_quic_keys_cleanup(qc->keys);
 
 #if (NGX_DEBUG)
-    ngx_log_debug1(NGX_LOG_DEBUG_EVENT, c->log, 0,
-                   "quic counters lost:%ui",
-                   qc->counters.loss_declared);
+    ngx_log_debug4(NGX_LOG_DEBUG_EVENT, c->log, 0,
+                   "quic counters lost:%ui reclaim:%ui ping_probe:%ui"
+                   " spurious:%ui",
+                   qc->counters.loss_declared,
+                   qc->counters.reclaimed_frames,
+                   qc->counters.ping_probes,
+                   qc->counters.spurious_loss_suspects);
 #endif
 
     ngx_log_debug0(NGX_LOG_DEBUG_EVENT, c->log, 0, "quic close completed");
@@ -1677,6 +1681,7 @@ ngx_quic_discard_ctx(ngx_connection_t *c, ngx_uint_t level)
     }
 
     ctx->send_ack = 0;
+    ctx->probe_pending = 0;
 
     ngx_quic_set_lost_timer(c);
 }
