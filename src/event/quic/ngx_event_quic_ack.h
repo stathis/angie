@@ -13,6 +13,25 @@
 #include <ngx_core.h>
 
 
+static ngx_inline uint64_t
+ngx_quic_current_usec(void)
+{
+#if (NGX_HAVE_CLOCK_MONOTONIC)
+    struct timespec  ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+
+    return (uint64_t) ts.tv_sec * 1000000 + (uint64_t) ts.tv_nsec / 1000;
+#else
+    struct timeval  tv;
+
+    ngx_gettimeofday(&tv);
+
+    return (uint64_t) tv.tv_sec * 1000000 + (uint64_t) tv.tv_usec;
+#endif
+}
+
+
 ngx_int_t ngx_quic_handle_ack_frame(ngx_connection_t *c,
     ngx_quic_header_t *pkt, ngx_quic_frame_t *f);
 

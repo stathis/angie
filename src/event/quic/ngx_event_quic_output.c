@@ -57,7 +57,7 @@ static ssize_t ngx_quic_send_segments(ngx_connection_t *c, u_char *buf,
 #endif
 static ssize_t ngx_quic_output_packet(ngx_connection_t *c,
     ngx_quic_send_ctx_t *ctx, u_char *data, size_t max, size_t min,
-    ngx_uint_t ack_only);
+    ngx_uint_t ack_only, ngx_uint_t *ack_eliciting);
 static void ngx_quic_init_packet(ngx_connection_t *c, ngx_quic_send_ctx_t *ctx,
     ngx_quic_header_t *pkt, ngx_quic_path_t *path);
 static ngx_uint_t ngx_quic_get_padding_level(ngx_connection_t *c);
@@ -119,11 +119,14 @@ ngx_quic_output(ngx_connection_t *c)
 static ngx_int_t
 ngx_quic_create_datagrams(ngx_connection_t *c)
 {
-    size_t                  len, min;
+    size_t                  len, min, burst, burst_sent, window;
     ssize_t                 n;
     u_char                 *p;
     uint64_t                preserved_pnum[NGX_QUIC_SEND_CTX_LAST];
-    ngx_uint_t              i, pad;
+    uint64_t                now_us;
+    ngx_uint_t              i, pad, allow_probe, ack_eliciting;
+    ngx_uint_t              has_probe, probe_mask;
+    ngx_msec_t              wait_ms;
     ngx_quic_path_t        *path;
     ngx_quic_send_ctx_t    *ctx;
     ngx_quic_congestion_t  *cg;
@@ -133,23 +136,64 @@ ngx_quic_create_datagrams(ngx_connection_t *c)
     qc = ngx_quic_get_connection(c);
     cg = &qc->congestion;
     path = qc->path;
+    window = cg->window;
+
+    burst_sent = 0;
 
 #if (NGX_SUPPRESS_WARN)
     ngx_memzero(preserved_pnum, sizeof(preserved_pnum));
 #endif
 
+    has_probe = 0;
+    for (i = 0; i < NGX_QUIC_SEND_CTX_LAST; i++) {
+        if (qc->send_ctx[i].probe_pending) {
+            has_probe = 1;
+            break;
+        }
+    }
+
+    now_us = ngx_quic_current_usec();
+
     do {
+        /* interval-based pacing check (microsecond precision) */
+        if (cg->pacing_interval > 0 && cg->pacing_next > now_us) {
+            if (!has_probe) {
+                /* pacing_next is in the future - schedule and stop */
+                if (!qc->push.timer_set) {
+                    wait_ms = (cg->pacing_next - now_us + 999) / 1000;
+                    if (wait_ms == 0) {
+                        wait_ms = 1;
+                    }
+                    ngx_add_timer(&qc->push, wait_ms);
+                }
+
+#if (NGX_DEBUG)
+                qc->counters.pacing_deferrals++;
+#endif
+                break;
+            }
+        }
+
         p = dst;
 
         len = ngx_quic_path_limit(c, path, path->mtu);
 
         pad = ngx_quic_get_padding_level(c);
 
+        probe_mask = 0;
+
         for (i = 0; i < NGX_QUIC_SEND_CTX_LAST; i++) {
 
             ctx = &qc->send_ctx[i];
 
             preserved_pnum[i] = ctx->pnum;
+
+            if (ctx->send_ack == 0
+                && ngx_queue_empty(&ctx->frames)
+                && ctx->probe_pending == 0)
+            {
+                continue;
+            }
 
             if (ngx_quic_generate_ack(c, ctx) != NGX_OK) {
                 return NGX_ERROR;
@@ -164,10 +208,23 @@ ngx_quic_create_datagrams(ngx_connection_t *c)
                 return NGX_OK;
             }
 
+            /* per-context probe bypass */
+            allow_probe = (ctx->probe_pending > 0);
+            ack_eliciting = 0;
+
             n = ngx_quic_output_packet(c, ctx, p, len, min,
-                                       cg->in_flight >= cg->window);
+                                       cg->in_flight >= window
+                                       && !allow_probe,
+                                       &ack_eliciting);
             if (n == NGX_ERROR) {
                 return NGX_ERROR;
+            }
+
+            /* track probe consumption; defer decrement to after commit */
+            if (n > 0 && ack_eliciting && allow_probe
+                && ctx->probe_pending > 0)
+            {
+                probe_mask |= (1 << i);
             }
 
             p += n;
@@ -193,9 +250,49 @@ ngx_quic_create_datagrams(ngx_connection_t *c)
 
         ngx_quic_commit_send(c);
 
+        /* apply deferred probe decrements and update has_probe */
+        if (probe_mask) {
+            has_probe = 0;
+            for (i = 0; i < NGX_QUIC_SEND_CTX_LAST; i++) {
+                if (probe_mask & (1 << i)) {
+                    if (--qc->send_ctx[i].probe_pending > 0) {
+                        has_probe = 1;
+                    }
+                } else if (qc->send_ctx[i].probe_pending) {
+                    has_probe = 1;
+                }
+            }
+        }
+
         path->sent += len;
 
-    } while (cg->in_flight < cg->window);
+        /* pacing: track bytes sent, enforce burst limit (probes exempt) */
+        if (cg->pacing_interval > 0 && !probe_mask && !has_probe) {
+            burst_sent += len;
+            /* burst limit: 10 packets (RFC 9002, 7.7) or 25% of cwnd */
+            burst = ngx_max(10 * path->mtu, window / 4);
+
+            if (burst_sent >= burst) {
+                /* burst exhausted - defer next send by pacing_interval */
+                now_us = ngx_quic_current_usec();
+                cg->pacing_next = now_us + cg->pacing_interval;
+
+                if (!qc->push.timer_set) {
+                    wait_ms = (cg->pacing_interval + 999) / 1000;
+                    if (wait_ms == 0) {
+                        wait_ms = 1;
+                    }
+                    ngx_add_timer(&qc->push, wait_ms);
+                }
+
+#if (NGX_DEBUG)
+                qc->counters.burst_cap_hits++;
+#endif
+                break;
+            }
+        }
+
+    } while (cg->in_flight < window || has_probe);
 
     return NGX_OK;
 }
@@ -295,6 +392,10 @@ ngx_quic_allow_segmentation(ngx_connection_t *c)
         return 0;
     }
 
+    if (qc->congestion.pacing_interval > 0) {
+        return 0;
+    }
+
     if (!qc->path->validated) {
         /* don't even try to be faster on non-validated paths */
         return 0;
@@ -376,7 +477,7 @@ ngx_quic_create_segments(ngx_connection_t *c)
 
         if (len && cg->in_flight + (p - dst) < cg->window) {
 
-            n = ngx_quic_output_packet(c, ctx, p, len, len, 0);
+            n = ngx_quic_output_packet(c, ctx, p, len, len, 0, NULL);
             if (n == NGX_ERROR) {
                 return NGX_ERROR;
             }
@@ -560,7 +661,8 @@ ngx_quic_get_padding_level(ngx_connection_t *c)
 
 static ssize_t
 ngx_quic_output_packet(ngx_connection_t *c, ngx_quic_send_ctx_t *ctx,
-    u_char *data, size_t max, size_t min, ngx_uint_t ack_only)
+    u_char *data, size_t max, size_t min, ngx_uint_t ack_only,
+    ngx_uint_t *ack_eliciting)
 {
     size_t                  len, pad, min_payload, max_payload;
     u_char                 *p;
@@ -702,6 +804,10 @@ ngx_quic_output_packet(ngx_connection_t *c, ngx_quic_send_ctx_t *ctx,
 
         ngx_queue_remove(q);
         ngx_queue_insert_tail(&ctx->sending, q);
+    }
+
+    if (ack_eliciting) {
+        *ack_eliciting = pkt.need_ack;
     }
 
     return res.len;
