@@ -197,6 +197,13 @@ typedef struct {
 } ngx_quic_congestion_t;
 
 
+#if (NGX_DEBUG)
+typedef struct {
+    ngx_uint_t                        loss_declared;
+} ngx_quic_counters_t;
+#endif
+
+
 /*
  * RFC 9000, 12.3.  Packet Numbers
  *
@@ -291,6 +298,9 @@ struct ngx_quic_connection_s {
 
     ngx_quic_streams_t                streams;
     ngx_quic_congestion_t             congestion;
+#if (NGX_DEBUG)
+    ngx_quic_counters_t               counters;
+#endif
 
     uint64_t                          rst_pnum;    /* first on validated path */
 
