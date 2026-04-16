@@ -14,6 +14,10 @@
 #define NGX_QUIC_PATH_MTU_DELAY       100
 #define NGX_QUIC_PATH_MTU_PRECISION   16
 
+#define NGX_QUIC_IPV4_HEADER_SIZE     20
+#define NGX_QUIC_IPV6_HEADER_SIZE     40
+#define NGX_QUIC_UDP_HEADER_SIZE      8
+
 
 static void ngx_quic_set_connection_path(ngx_connection_t *c,
     ngx_quic_path_t *path);
@@ -611,11 +615,46 @@ ngx_quic_send_path_challenge(ngx_connection_t *c, ngx_quic_path_t *path)
 void
 ngx_quic_discover_path_mtu(ngx_connection_t *c, ngx_quic_path_t *path)
 {
+    size_t                  limit, overhead;
     ngx_quic_connection_t  *qc;
 
     qc = ngx_quic_get_connection(c);
 
+    limit = qc->peer_tp.max_udp_payload_size;
+
+    if (qc->conf->max_mtu) {
+
+        /*
+         * quic_max_mtu is the link-layer MTU (e.g. 1500 for Ethernet);
+         * subtract IP and UDP headers to get max QUIC packet size (PLPMTU)
+         */
+
+        overhead = NGX_QUIC_UDP_HEADER_SIZE;
+
+        if (c->local_sockaddr && c->local_sockaddr->sa_family == AF_INET6) {
+            overhead += NGX_QUIC_IPV6_HEADER_SIZE;
+        } else {
+            overhead += NGX_QUIC_IPV4_HEADER_SIZE;
+        }
+
+        if (qc->conf->max_mtu > overhead) {
+            limit = ngx_min(qc->conf->max_mtu - overhead, limit);
+        }
+
+        /*
+         * RFC 9000, 14. Datagram Size: a path MTU below 1200 bytes
+         * must not be assumed; quic_max_mtu values just above 1200
+         * would otherwise yield a sub-minimum PLPMTU after the
+         * IP/UDP overhead is subtracted
+         */
+
+        if (limit < NGX_QUIC_MIN_INITIAL_SIZE) {
+            limit = NGX_QUIC_MIN_INITIAL_SIZE;
+        }
+    }
+
     if (path->max_mtu) {
+        /* binary search: upper bound known from prior failure or init */
         if (path->max_mtu - path->mtu <= NGX_QUIC_PATH_MTU_PRECISION) {
             path->state = NGX_QUIC_PATH_IDLE;
             ngx_quic_set_path_timer(c);
@@ -624,12 +663,18 @@ ngx_quic_discover_path_mtu(ngx_connection_t *c, ngx_quic_path_t *path)
 
         path->mtud = (path->mtu + path->max_mtu) / 2;
 
+    } else if (qc->conf->max_mtu) {
+        /* OptBinary: probe the configured limit directly */
+        path->mtud = limit;
+        path->max_mtu = limit;
+
     } else {
+        /* no limit configured (quic_max_mtu 0): double from current */
         path->mtud = path->mtu * 2;
 
-        if (path->mtud >= qc->peer_tp.max_udp_payload_size) {
-            path->mtud = qc->peer_tp.max_udp_payload_size;
-            path->max_mtu = qc->peer_tp.max_udp_payload_size;
+        if (path->mtud >= limit) {
+            path->mtud = limit;
+            path->max_mtu = limit;
         }
     }
 
