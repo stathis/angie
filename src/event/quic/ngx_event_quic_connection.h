@@ -131,6 +131,7 @@ struct ngx_quic_path_s {
     uint64_t                          mtu_pnum[NGX_QUIC_PATH_RETRIES];
     ngx_str_t                         addr_text;
     u_char                            text[NGX_SOCKADDR_STRLEN];
+    ngx_uint_t                        mtu_fails;
     unsigned                          validated:1;
     unsigned                          mtu_unvalidated:1;
 };
@@ -208,6 +209,7 @@ typedef struct {
     ngx_uint_t                        spurious_loss_suspects;
     ngx_uint_t                        pacing_deferrals;
     ngx_uint_t                        burst_cap_hits;
+    ngx_uint_t                        mtu_blackhole_detected;
 } ngx_quic_counters_t;
 #endif
 
