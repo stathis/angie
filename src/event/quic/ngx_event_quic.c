@@ -1070,6 +1070,12 @@ ngx_quic_close_connection(ngx_connection_t *c, ngx_int_t rc)
 
     ngx_quic_keys_cleanup(qc->keys);
 
+#if (NGX_DEBUG)
+    ngx_log_debug1(NGX_LOG_DEBUG_EVENT, c->log, 0,
+                   "quic counters lost:%ui",
+                   qc->counters.loss_declared);
+#endif
+
     ngx_log_debug0(NGX_LOG_DEBUG_EVENT, c->log, 0, "quic close completed");
 
     /* may be tested from SSL callback during SSL shutdown */
