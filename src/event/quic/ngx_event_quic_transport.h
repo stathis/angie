@@ -274,6 +274,7 @@ struct ngx_quic_frame_s {
     unsigned                                    pkt_need_ack:1;
     unsigned                                    ignore_congestion:1;
     unsigned                                    ignore_loss:1;
+    unsigned                                    reclaimed:1;
 
     ngx_chain_t                                *data;
     union {

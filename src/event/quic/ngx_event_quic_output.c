@@ -284,6 +284,7 @@ static ngx_uint_t
 ngx_quic_allow_segmentation(ngx_connection_t *c)
 {
     size_t                  bytes, len;
+    ngx_uint_t              i;
     ngx_queue_t            *q;
     ngx_quic_frame_t       *f;
     ngx_quic_send_ctx_t    *ctx;
@@ -293,6 +294,18 @@ ngx_quic_allow_segmentation(ngx_connection_t *c)
 
     if (!qc->conf->gso_enabled) {
         return 0;
+    }
+
+    /*
+     * the segmented path does not track probe consumption; route PTO
+     * probe sends through the datagram path so the probe budget is
+     * accounted and the PING fallback does not double-spend it
+     */
+
+    for (i = 0; i < NGX_QUIC_SEND_CTX_LAST; i++) {
+        if (qc->send_ctx[i].probe_pending) {
+            return 0;
+        }
     }
 
     if (!qc->path->validated) {

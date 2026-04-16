@@ -61,6 +61,8 @@ static void ngx_quic_congestion_lost(ngx_connection_t *c,
 static ngx_int_t ngx_quic_ping_peer(ngx_connection_t *c,
     ngx_quic_send_ctx_t *ctx);
 static void ngx_quic_lost_handler(ngx_event_t *ev);
+static ngx_uint_t ngx_quic_reclaim_for_probe(ngx_connection_t *c,
+    ngx_quic_send_ctx_t *ctx, ngx_uint_t num);
 
 
 static ngx_inline ngx_msec_t
@@ -337,6 +339,12 @@ ngx_quic_handle_ack_frame_range(ngx_connection_t *c, ngx_quic_send_ctx_t *ctx,
             if (st->newest == NGX_TIMER_INFINITE || f->send_time > st->newest) {
                 st->newest = f->send_time;
             }
+
+#if (NGX_DEBUG)
+            if (f->reclaimed) {
+                qc->counters.spurious_loss_suspects++;
+            }
+#endif
 
             ngx_queue_remove(&f->queue);
             ngx_quic_free_frame(c, f);
@@ -848,6 +856,12 @@ ngx_quic_resend_frames(ngx_connection_t *c, ngx_quic_send_ctx_t *ctx)
 
         ngx_queue_remove(&f->queue);
 
+        /*
+         * the retransmission is a fresh send; without this, a frame once
+         * copied for a probe would be skipped by all future probe reclaims
+         */
+        f->reclaimed = 0;
+
         switch (f->type) {
         case NGX_QUIC_FT_ACK:
         case NGX_QUIC_FT_ACK_ECN:
@@ -915,6 +929,194 @@ ngx_quic_resend_frames(ngx_connection_t *c, ngx_quic_send_ctx_t *ctx)
     }
 
     ngx_post_event(&qc->push, &ngx_posted_events);
+}
+
+
+static ngx_uint_t
+ngx_quic_reclaim_for_probe(ngx_connection_t *c, ngx_quic_send_ctx_t *ctx,
+    ngx_uint_t num)
+{
+    u_char                 *p;
+    size_t                  len, n;
+    uint64_t                pnum;
+    ngx_uint_t              reclaimed;
+    ngx_queue_t            *q, *qn;
+    ngx_chain_t            *cl, *data;
+    ngx_quic_frame_t       *f, *nf;
+    ngx_quic_stream_t      *qs;
+    ngx_quic_connection_t  *qc;
+
+    qc = ngx_quic_get_connection(c);
+    reclaimed = 0;
+
+    if (ngx_queue_empty(&ctx->sent)) {
+        return 0;
+    }
+
+    for (q = ngx_queue_head(&ctx->sent);
+         q != ngx_queue_sentinel(&ctx->sent) && reclaimed < num;
+         q = qn)
+    {
+        f = ngx_queue_data(q, ngx_quic_frame_t, queue);
+        qn = ngx_queue_next(q);
+
+        if (f->reclaimed) {
+            /* skip to next packet */
+            pnum = f->pnum;
+
+            while (qn != ngx_queue_sentinel(&ctx->sent)) {
+                f = ngx_queue_data(qn, ngx_quic_frame_t, queue);
+                if (f->pnum != pnum) {
+                    break;
+                }
+                qn = ngx_queue_next(qn);
+            }
+
+            continue;
+        }
+
+        switch (f->type) {
+
+        case NGX_QUIC_FT_STREAM:
+            qs = ngx_quic_find_stream(&qc->streams.tree,
+                                      f->u.stream.stream_id);
+
+            if (qs == NULL
+                || qs->send_state == NGX_QUIC_STREAM_SEND_RESET_SENT
+                || qs->send_state == NGX_QUIC_STREAM_SEND_RESET_RECVD
+                || qs->send_state == NGX_QUIC_STREAM_SEND_DATA_RECVD)
+            {
+                break;
+            }
+
+            nf = ngx_quic_alloc_frame(c);
+            if (nf == NULL) {
+                return reclaimed;
+            }
+
+            /* make independent copy of frame data */
+
+            len = 0;
+            for (cl = f->data; cl; cl = cl->next) {
+                len += cl->buf->last - cl->buf->pos;
+            }
+
+            if (len > 0) {
+                data = ngx_quic_alloc_chain(c);
+                if (data == NULL) {
+                    ngx_quic_free_frame(c, nf);
+                    return reclaimed;
+                }
+
+                data->next = NULL;
+
+                if (len > (size_t) (data->buf->end - data->buf->pos)) {
+                    ngx_quic_free_chain(c, data);
+                    ngx_quic_free_frame(c, nf);
+                    break;
+                }
+
+                p = data->buf->pos;
+                for (cl = f->data; cl; cl = cl->next) {
+                    n = cl->buf->last - cl->buf->pos;
+                    ngx_memcpy(p, cl->buf->pos, n);
+                    p += n;
+                }
+
+                data->buf->last = p;
+
+            } else {
+                data = NULL;
+            }
+
+            *nf = *f;
+            nf->data = data;
+            nf->reclaimed = 0;
+            nf->len = ngx_quic_create_frame(NULL, nf);
+
+            ngx_queue_insert_head(&ctx->frames, &nf->queue);
+
+            f->reclaimed = 1;
+            reclaimed++;
+#if (NGX_DEBUG)
+            qc->counters.reclaimed_frames++;
+#endif
+
+            ngx_log_debug2(NGX_LOG_DEBUG_EVENT, c->log, 0,
+                           "quic reclaim pnum:%uL type:0x%xi",
+                           f->pnum, (ngx_int_t) f->type);
+            break;
+
+        case NGX_QUIC_FT_MAX_DATA:
+        case NGX_QUIC_FT_MAX_STREAMS:
+        case NGX_QUIC_FT_MAX_STREAMS2:
+        case NGX_QUIC_FT_MAX_STREAM_DATA:
+
+            nf = ngx_quic_alloc_frame(c);
+            if (nf == NULL) {
+                return reclaimed;
+            }
+
+            *nf = *f;
+            nf->data = NULL;
+            nf->reclaimed = 0;
+
+            /* refresh with current values */
+
+            if (nf->type == NGX_QUIC_FT_MAX_DATA) {
+                nf->u.max_data.max_data = qc->streams.recv_max_data;
+
+            } else if (nf->type == NGX_QUIC_FT_MAX_STREAMS
+                       || nf->type == NGX_QUIC_FT_MAX_STREAMS2)
+            {
+                nf->u.max_streams.limit = nf->u.max_streams.bidi
+                                          ? qc->streams.client.bidi.max
+                                          : qc->streams.client.uni.max;
+
+            } else {
+                qs = ngx_quic_find_stream(&qc->streams.tree,
+                                          nf->u.max_stream_data.id);
+                if (qs == NULL) {
+                    ngx_quic_free_frame(c, nf);
+                    break;
+                }
+
+                nf->u.max_stream_data.limit = qs->recv_max_data;
+            }
+
+            nf->len = ngx_quic_create_frame(NULL, nf);
+
+            ngx_queue_insert_head(&ctx->frames, &nf->queue);
+
+            f->reclaimed = 1;
+            reclaimed++;
+#if (NGX_DEBUG)
+            qc->counters.reclaimed_frames++;
+#endif
+
+            ngx_log_debug2(NGX_LOG_DEBUG_EVENT, c->log, 0,
+                           "quic reclaim pnum:%uL type:0x%xi",
+                           f->pnum, (ngx_int_t) f->type);
+            break;
+
+        default:
+            break;
+        }
+
+        /* skip remaining frames in same packet */
+
+        pnum = f->pnum;
+
+        while (qn != ngx_queue_sentinel(&ctx->sent)) {
+            f = ngx_queue_data(qn, ngx_quic_frame_t, queue);
+            if (f->pnum != pnum) {
+                break;
+            }
+            qn = ngx_queue_next(qn);
+        }
+    }
+
+    return reclaimed;
 }
 
 
@@ -1249,12 +1451,46 @@ ngx_quic_pto_handler(ngx_event_t *ev)
                        "quic pto %s pto_count:%ui",
                        ngx_quic_level_name(ctx->level), qc->pto_count);
 
-        if (ngx_quic_ping_peer(c, ctx) != NGX_OK) {
-            ngx_quic_close_connection(c, NGX_ERROR);
-            return;
-        }
+        ctx->probe_pending = ngx_min(ctx->probe_pending + 2, 4);
+
+        /* reclaim retransmittable data from sent queue for this context */
+        ngx_quic_reclaim_for_probe(c, ctx, 2);
 
         sent = 1;
+    }
+
+    /* try to send data probes via normal output path */
+    if (sent && ngx_quic_output(c) != NGX_OK) {
+        ngx_quic_close_connection(c, NGX_ERROR);
+        return;
+    }
+
+    /* PING fallback for remaining probes (no data available) */
+    for (i = 0; i < NGX_QUIC_SEND_CTX_LAST; i++) {
+        ctx = &qc->send_ctx[i];
+
+        while (ctx->probe_pending > 0) {
+
+            f = ngx_quic_alloc_frame(c);
+            if (f == NULL) {
+                ngx_quic_close_connection(c, NGX_ERROR);
+                return;
+            }
+
+            f->level = ctx->level;
+            f->type = NGX_QUIC_FT_PING;
+            f->ignore_congestion = 1;
+
+            if (ngx_quic_frame_sendto(c, f, 0, qc->path) != NGX_OK) {
+                ngx_quic_close_connection(c, NGX_ERROR);
+                return;
+            }
+
+#if (NGX_DEBUG)
+            qc->counters.ping_probes++;
+#endif
+            ctx->probe_pending--;
+        }
     }
 
 
