@@ -41,6 +41,8 @@ static ngx_inline ngx_msec_t ngx_quic_rttvar_margin(
 static ngx_inline ngx_msec_t ngx_quic_reorder_margin(
     ngx_quic_connection_t *qc, ngx_msec_t thr);
 static ngx_inline ngx_msec_t ngx_quic_time_threshold(ngx_quic_connection_t *qc);
+static void ngx_quic_update_pacing(ngx_connection_t *c,
+    ngx_uint_t in_slow_start);
 static uint64_t ngx_quic_packet_threshold(ngx_quic_send_ctx_t *ctx);
 static void ngx_quic_rtt_sample(ngx_connection_t *c, ngx_quic_ack_frame_t *ack,
     ngx_uint_t level, ngx_msec_t send_time);
@@ -96,6 +98,44 @@ ngx_quic_time_threshold(ngx_quic_connection_t *qc)
     thr += ngx_quic_rttvar_margin(qc);
 
     return thr;
+}
+
+
+static void
+ngx_quic_update_pacing(ngx_connection_t *c, ngx_uint_t in_slow_start)
+{
+    uint64_t                avg_rtt_us;
+    ngx_quic_congestion_t  *cg;
+    ngx_quic_connection_t  *qc;
+
+    qc = ngx_quic_get_connection(c);
+    cg = &qc->congestion;
+
+    if (qc->avg_rtt == 0 || cg->window == 0) {
+        return;
+    }
+
+    avg_rtt_us = (uint64_t) qc->avg_rtt * 1000;
+
+    cg->pacing_interval = avg_rtt_us * cg->mtu / cg->window;
+
+    if (in_slow_start) {
+        cg->pacing_interval /= 2;
+    }
+
+    if (cg->pacing_interval > avg_rtt_us) {
+        cg->pacing_interval = avg_rtt_us;
+    }
+
+    /* sub-ms intervals are not enforceable by nginx timers; disable pacing */
+    if (cg->pacing_interval < 1000) {
+        cg->pacing_interval = 0;
+    }
+
+    if (cg->pacing_time == 0) {
+        cg->pacing_time = 1;
+        cg->pacing_next = ngx_quic_current_usec();
+    }
 }
 
 
@@ -493,6 +533,8 @@ ngx_quic_congestion_ack(ngx_connection_t *c, ngx_quic_frame_t *f)
         }
     }
 
+    ngx_quic_update_pacing(c, cg->window < cg->ssthresh);
+
 done:
 
     if (blocked && cg->in_flight < cg->window) {
@@ -789,6 +831,8 @@ ngx_quic_persistent_congestion(ngx_connection_t *c)
     cg->mtu = qc->path->mtu;
     cg->recovery_start = ngx_quic_oldest_sent_packet(c) - 1;
     cg->window = cg->mtu * 2;
+
+    ngx_quic_update_pacing(c, 1);
 
     ngx_log_debug2(NGX_LOG_DEBUG_EVENT, c->log, 0,
                    "quic congestion persistent t:%M win:%uz",
@@ -1177,6 +1221,8 @@ ngx_quic_congestion_lost(ngx_connection_t *c, ngx_quic_frame_t *f)
     cg->w_est = cg->window;
     cg->k = now + ngx_quic_congestion_cubic_time(c);
     cg->idle_start = now;
+
+    ngx_quic_update_pacing(c, 0);
 
     ngx_log_debug3(NGX_LOG_DEBUG_EVENT, c->log, 0,
                    "quic congestion lost t:%M win:%uz if:%uz",

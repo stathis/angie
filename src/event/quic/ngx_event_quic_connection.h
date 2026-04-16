@@ -194,6 +194,9 @@ typedef struct {
     ngx_msec_t                        idle_start;
     ngx_msec_t                        k;
     ngx_uint_t                        idle; /* unsigned  idle:1; */
+    uint64_t                          pacing_interval;  /* microseconds */
+    uint64_t                          pacing_next;      /* microseconds */
+    ngx_msec_t                        pacing_time;
 } ngx_quic_congestion_t;
 
 
@@ -203,6 +206,8 @@ typedef struct {
     ngx_uint_t                        reclaimed_frames;
     ngx_uint_t                        ping_probes;
     ngx_uint_t                        spurious_loss_suspects;
+    ngx_uint_t                        pacing_deferrals;
+    ngx_uint_t                        burst_cap_hits;
 } ngx_quic_counters_t;
 #endif
 
