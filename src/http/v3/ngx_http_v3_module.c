@@ -92,6 +92,13 @@ static ngx_command_t  ngx_http_v3_commands[] = {
       offsetof(ngx_http_v3_srv_conf_t, quic.active_connection_id_limit),
       NULL },
 
+    { ngx_string("quic_max_mtu"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_size_slot,
+      NGX_HTTP_SRV_CONF_OFFSET,
+      offsetof(ngx_http_v3_srv_conf_t, quic.max_mtu),
+      NULL },
+
       ngx_null_command
 };
 
@@ -253,6 +260,7 @@ ngx_http_v3_create_srv_conf(ngx_conf_t *cf)
     h3scf->settings.max_concurrent_streams = NGX_CONF_UNSET_UINT;
 
     h3scf->quic.stream_buffer_size = NGX_CONF_UNSET_SIZE;
+    h3scf->quic.max_mtu = NGX_CONF_UNSET_SIZE;
     h3scf->quic.max_concurrent_streams_bidi = NGX_CONF_UNSET_UINT;
     h3scf->quic.max_concurrent_streams_uni = NGX_HTTP_V3_MAX_UNI_STREAMS;
     h3scf->quic.retry = NGX_CONF_UNSET;
@@ -296,6 +304,19 @@ ngx_http_v3_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_size_value(conf->quic.stream_buffer_size,
                               prev->quic.stream_buffer_size,
                               65536);
+
+    ngx_conf_merge_size_value(conf->quic.max_mtu,
+                              prev->quic.max_mtu,
+                              1500);
+
+    if (conf->quic.max_mtu != 0
+        && conf->quic.max_mtu < NGX_QUIC_MIN_INITIAL_SIZE)
+    {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "\"quic_max_mtu\" must be 0 or at least %d",
+                           NGX_QUIC_MIN_INITIAL_SIZE);
+        return NGX_CONF_ERROR;
+    }
 
     conf->quic.max_concurrent_streams_bidi =
                                          conf->settings.max_concurrent_streams;
