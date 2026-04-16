@@ -38,6 +38,7 @@ ngx_int_t ngx_quic_handle_migration(ngx_connection_t *c,
 
 void ngx_quic_path_handler(ngx_event_t *ev);
 
+void ngx_quic_set_path_timer(ngx_connection_t *c);
 void ngx_quic_discover_path_mtu(ngx_connection_t *c, ngx_quic_path_t *path);
 ngx_int_t ngx_quic_handle_path_mtu(ngx_connection_t *c,
     ngx_quic_path_t *path, uint64_t min, uint64_t max);

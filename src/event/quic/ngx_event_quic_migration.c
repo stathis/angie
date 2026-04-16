@@ -21,7 +21,6 @@ static ngx_int_t ngx_quic_validate_path(ngx_connection_t *c,
     ngx_quic_path_t *path);
 static ngx_int_t ngx_quic_send_path_challenge(ngx_connection_t *c,
     ngx_quic_path_t *path);
-static void ngx_quic_set_path_timer(ngx_connection_t *c);
 static ngx_int_t ngx_quic_expire_path_validation(ngx_connection_t *c,
     ngx_quic_path_t *path);
 static ngx_int_t ngx_quic_expire_path_mtu_delay(ngx_connection_t *c,
@@ -645,7 +644,7 @@ ngx_quic_discover_path_mtu(ngx_connection_t *c, ngx_quic_path_t *path)
 }
 
 
-static void
+void
 ngx_quic_set_path_timer(ngx_connection_t *c)
 {
     ngx_msec_t              now;
@@ -826,6 +825,12 @@ ngx_quic_expire_path_mtu_delay(ngx_connection_t *c, ngx_quic_path_t *path)
 
     qc = ngx_quic_get_connection(c);
     ctx = ngx_quic_get_send_ctx(qc, NGX_QUIC_ENCRYPTION_APPLICATION);
+
+    /* re-probe after MTU black-hole fallback: restart discovery */
+    if (path->mtud == 0) {
+        ngx_quic_discover_path_mtu(c, path);
+        return NGX_OK;
+    }
 
     path->tries = 0;
 

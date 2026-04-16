@@ -13,6 +13,13 @@
 
 #define NGX_QUIC_MAX_ACK_GAP                 2
 
+/* consecutive loss epochs before MTU fallback (RFC 8899, 5.1.2) */
+#define NGX_QUIC_MTU_BLACKHOLE_THR           6
+/* consecutive PTO rounds before MTU fallback */
+#define NGX_QUIC_MTU_PTO_THR                 2
+/* delay before re-probing after black-hole fallback, ms */
+#define NGX_QUIC_MTU_REPROBE_DELAY           60000
+
 /* RFC 9002, 6.1.1. Packet Threshold: kPacketThreshold */
 #define NGX_QUIC_PKT_THR                     3 /* packets */
 /* RFC 9002, 6.1.2. Time Threshold: kGranularity */
@@ -58,6 +65,8 @@ static void ngx_quic_persistent_congestion(ngx_connection_t *c);
 static ngx_msec_t ngx_quic_oldest_sent_packet(ngx_connection_t *c);
 static void ngx_quic_congestion_lost(ngx_connection_t *c,
     ngx_quic_frame_t *frame);
+static void ngx_quic_mtu_blackhole_fallback(ngx_connection_t *c,
+    ngx_msec_t now);
 static ngx_int_t ngx_quic_ping_peer(ngx_connection_t *c,
     ngx_quic_send_ctx_t *ctx);
 static void ngx_quic_lost_handler(ngx_event_t *ev);
@@ -412,6 +421,10 @@ ngx_quic_handle_ack_frame_range(ngx_connection_t *c, ngx_quic_send_ctx_t *ctx,
     }
 
     qc->pto_count = 0;
+
+    if (ctx->level == NGX_QUIC_ENCRYPTION_APPLICATION) {
+        qc->path->mtu_fails = 0;
+    }
 
     return NGX_OK;
 }
@@ -1145,10 +1158,46 @@ ngx_quic_reclaim_for_probe(ngx_connection_t *c, ngx_quic_send_ctx_t *ctx,
 
 
 static void
+ngx_quic_mtu_blackhole_fallback(ngx_connection_t *c, ngx_msec_t now)
+{
+    ngx_quic_congestion_t  *cg;
+    ngx_quic_connection_t  *qc;
+    ngx_quic_path_t        *path;
+
+    qc = ngx_quic_get_connection(c);
+    path = qc->path;
+    cg = &qc->congestion;
+
+    ngx_log_error(NGX_LOG_NOTICE, c->log, 0,
+                  "quic path seq:%uL mtu black-hole detected, "
+                  "falling back from %uz to %uz",
+                  path->seqnum, path->mtu,
+                  (size_t) NGX_QUIC_MIN_INITIAL_SIZE);
+
+    path->mtu = NGX_QUIC_MIN_INITIAL_SIZE;
+    path->max_mtu = 0;
+    path->mtu_fails = 0;
+
+    cg->mtu = NGX_QUIC_MIN_INITIAL_SIZE;
+
+    /* schedule PMTUD re-probe after cooldown */
+    path->mtud = 0;
+    path->state = NGX_QUIC_PATH_WAITING;
+    path->expires = now + NGX_QUIC_MTU_REPROBE_DELAY;
+    ngx_quic_set_path_timer(c);
+
+#if (NGX_DEBUG)
+    qc->counters.mtu_blackhole_detected++;
+#endif
+}
+
+
+static void
 ngx_quic_congestion_lost(ngx_connection_t *c, ngx_quic_frame_t *f)
 {
     ngx_uint_t              blocked;
     ngx_msec_t              now, timer;
+    ngx_quic_path_t        *path;
     ngx_quic_congestion_t  *cg;
     ngx_quic_connection_t  *qc;
 
@@ -1172,6 +1221,8 @@ ngx_quic_congestion_lost(ngx_connection_t *c, ngx_quic_frame_t *f)
 
     now = ngx_current_msec;
 
+    path = qc->path;
+
     if ((ngx_msec_int_t) timer <= 0) {
         ngx_log_debug3(NGX_LOG_DEBUG_EVENT, c->log, 0,
                        "quic congestion lost rec t:%M win:%uz if:%uz",
@@ -1192,6 +1243,23 @@ ngx_quic_congestion_lost(ngx_connection_t *c, ngx_quic_frame_t *f)
 
     cg->mtu = qc->path->mtu;
     cg->recovery_start = now;
+
+    /*
+     * MTU black-hole detection: count one failure per new recovery epoch.
+     * Burst losses within a single epoch reach here only once (the rest
+     * hit timer <= 0 and goto done above), so no dedup logic is needed.
+     * A real black-hole causes persistent failures across many epochs.
+     */
+
+    if (f->level == NGX_QUIC_ENCRYPTION_APPLICATION
+        && path->mtu > NGX_QUIC_MIN_INITIAL_SIZE)
+    {
+        path->mtu_fails++;
+
+        if (path->mtu_fails >= NGX_QUIC_MTU_BLACKHOLE_THR) {
+            ngx_quic_mtu_blackhole_fallback(c, now);
+        }
+    }
     cg->w_prior = cg->window;
     /* RFC 9438, 4.7. Fast Convergence */
     cg->w_max = (cg->window < cg->w_max)
@@ -1430,6 +1498,7 @@ ngx_quic_pto_handler(ngx_event_t *ev)
     ngx_connection_t       *c;
     ngx_quic_frame_t       *f;
     ngx_quic_send_ctx_t    *ctx;
+    ngx_quic_congestion_t  *cg;
     ngx_quic_connection_t  *qc;
 
     ngx_log_debug0(NGX_LOG_DEBUG_EVENT, ev->log, 0, "quic pto timer");
@@ -1534,6 +1603,59 @@ ngx_quic_pto_handler(ngx_event_t *ev)
     }
 
     qc->pto_count++;
+
+    if (qc->pto_count >= NGX_QUIC_MTU_PTO_THR
+        && qc->path->mtu > NGX_QUIC_MIN_INITIAL_SIZE)
+    {
+        ngx_log_debug1(NGX_LOG_DEBUG_EVENT, c->log, 0,
+                       "quic mtu pto black-hole after %ui PTOs",
+                       qc->pto_count);
+
+        ngx_quic_mtu_blackhole_fallback(c, now);
+
+        cg = &qc->congestion;
+
+        /* purge oversized in-flight */
+        for (i = 0; i < NGX_QUIC_SEND_CTX_LAST; i++) {
+            ctx = &qc->send_ctx[i];
+
+            for (q = ngx_queue_head(&ctx->sent);
+                 q != ngx_queue_sentinel(&ctx->sent);
+                 q = ngx_queue_next(q))
+            {
+                f = ngx_queue_data(q, ngx_quic_frame_t, queue);
+
+                if (f->plen > NGX_QUIC_MIN_INITIAL_SIZE) {
+                    cg->in_flight -= f->plen;
+                    f->plen = 0;
+                }
+            }
+        }
+
+        /* CUBIC decrease on deflated in_flight */
+        cg->recovery_start = now;
+        cg->w_prior = cg->window;
+        cg->w_max = cg->window;
+        cg->ssthresh = cg->in_flight * NGX_QUIC_CUBIC_BETA / 10;
+        cg->window = ngx_max(cg->ssthresh, cg->mtu * 2);
+        cg->w_est = cg->window;
+        cg->k = now + ngx_quic_congestion_cubic_time(c);
+        cg->idle_start = now;
+
+        ngx_quic_update_pacing(c, 0);
+
+        qc->pto_count = 0;
+
+        /* immediately send probes at new MTU */
+        ctx = ngx_quic_get_send_ctx(qc, NGX_QUIC_ENCRYPTION_APPLICATION);
+        ctx->probe_pending = ngx_min(ctx->probe_pending + 2, 4);
+        ngx_quic_reclaim_for_probe(c, ctx, 2);
+
+        if (ngx_quic_output(c) != NGX_OK) {
+            ngx_quic_close_connection(c, NGX_ERROR);
+            return;
+        }
+    }
 
     ngx_quic_set_lost_timer(c);
 

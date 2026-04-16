@@ -1071,15 +1071,17 @@ ngx_quic_close_connection(ngx_connection_t *c, ngx_int_t rc)
     ngx_quic_keys_cleanup(qc->keys);
 
 #if (NGX_DEBUG)
-    ngx_log_debug6(NGX_LOG_DEBUG_EVENT, c->log, 0,
+    ngx_log_debug7(NGX_LOG_DEBUG_EVENT, c->log, 0,
                    "quic counters lost:%ui reclaim:%ui ping_probe:%ui"
-                   " spurious:%ui pace_defer:%ui burst_cap:%ui",
+                   " spurious:%ui pace_defer:%ui burst_cap:%ui"
+                   " mtu_bh:%ui",
                    qc->counters.loss_declared,
                    qc->counters.reclaimed_frames,
                    qc->counters.ping_probes,
                    qc->counters.spurious_loss_suspects,
                    qc->counters.pacing_deferrals,
-                   qc->counters.burst_cap_hits);
+                   qc->counters.burst_cap_hits,
+                   qc->counters.mtu_blackhole_detected);
 #endif
 
     ngx_log_debug0(NGX_LOG_DEBUG_EVENT, c->log, 0, "quic close completed");
