@@ -1626,7 +1626,11 @@ ngx_quic_pto_handler(ngx_event_t *ev)
                 f = ngx_queue_data(q, ngx_quic_frame_t, queue);
 
                 if (f->plen > NGX_QUIC_MIN_INITIAL_SIZE) {
-                    cg->in_flight -= f->plen;
+                    if (cg->in_flight > f->plen) {
+                        cg->in_flight -= f->plen;
+                    } else {
+                        cg->in_flight = 0;
+                    }
                     f->plen = 0;
                 }
             }
