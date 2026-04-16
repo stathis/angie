@@ -17,6 +17,8 @@
 #define NGX_QUIC_PKT_THR                     3 /* packets */
 /* RFC 9002, 6.1.2. Time Threshold: kGranularity */
 #define NGX_QUIC_TIME_GRANULARITY            1 /* ms */
+/* RFC 9002, 6.1.2. Time Threshold: rttvar multiplier */
+#define NGX_QUIC_RTTVAR_MULTIPLIER           4
 
 /* RFC 9002, 7.6.1. Duration: kPersistentCongestionThreshold */
 #define NGX_QUIC_PERSISTENT_CONGESTION_THR   3
@@ -34,6 +36,10 @@ typedef struct {
 } ngx_quic_ack_stat_t;
 
 
+static ngx_inline ngx_msec_t ngx_quic_rttvar_margin(
+    ngx_quic_connection_t *qc);
+static ngx_inline ngx_msec_t ngx_quic_reorder_margin(
+    ngx_quic_connection_t *qc, ngx_msec_t thr);
 static ngx_inline ngx_msec_t ngx_quic_time_threshold(ngx_quic_connection_t *qc);
 static uint64_t ngx_quic_packet_threshold(ngx_quic_send_ctx_t *ctx);
 static void ngx_quic_rtt_sample(ngx_connection_t *c, ngx_quic_ack_frame_t *ack,
@@ -57,6 +63,26 @@ static ngx_int_t ngx_quic_ping_peer(ngx_connection_t *c,
 static void ngx_quic_lost_handler(ngx_event_t *ev);
 
 
+static ngx_inline ngx_msec_t
+ngx_quic_rttvar_margin(ngx_quic_connection_t *qc)
+{
+    return ngx_max(NGX_QUIC_RTTVAR_MULTIPLIER * qc->rttvar,
+                   NGX_QUIC_TIME_GRANULARITY);
+}
+
+
+/*
+ * jitter grace before the time threshold at which a packet meeting
+ * the packet threshold is declared lost; loss detection and the lost
+ * timer must agree on this value
+ */
+static ngx_inline ngx_msec_t
+ngx_quic_reorder_margin(ngx_quic_connection_t *qc, ngx_msec_t thr)
+{
+    return ngx_min(qc->rttvar, thr / 4);
+}
+
+
 /* RFC 9002, 6.1.2. Time Threshold: kTimeThreshold, kGranularity */
 static ngx_inline ngx_msec_t
 ngx_quic_time_threshold(ngx_quic_connection_t *qc)
@@ -65,8 +91,9 @@ ngx_quic_time_threshold(ngx_quic_connection_t *qc)
 
     thr = ngx_max(qc->latest_rtt, qc->avg_rtt);
     thr += thr >> 3;
+    thr += ngx_quic_rttvar_margin(qc);
 
-    return ngx_max(thr, NGX_QUIC_TIME_GRANULARITY);
+    return thr;
 }
 
 
@@ -624,7 +651,7 @@ ngx_quic_detect_lost(ngx_connection_t *c, ngx_quic_ack_stat_t *st)
 {
     uint64_t                pkt_thr;
     ngx_uint_t              i, nlost;
-    ngx_msec_t              now, wait, thr, oldest, newest;
+    ngx_msec_t              now, wait, thr, margin, oldest, newest;
     ngx_queue_t            *q;
     ngx_quic_frame_t       *start;
     ngx_quic_send_ctx_t    *ctx;
@@ -633,6 +660,7 @@ ngx_quic_detect_lost(ngx_connection_t *c, ngx_quic_ack_stat_t *st)
     qc = ngx_quic_get_connection(c);
     now = ngx_current_msec;
     thr = ngx_quic_time_threshold(qc);
+    margin = ngx_quic_reorder_margin(qc, thr);
 
 #if (NGX_SUPPRESS_WARN)
     oldest = now;
@@ -666,10 +694,14 @@ ngx_quic_detect_lost(ngx_connection_t *c, ngx_quic_ack_stat_t *st)
                   "quic detect_lost pnum:%uL thr:%M pthr:%uL wait:%i level:%ui",
                   start->pnum, thr, pkt_thr, (ngx_int_t) wait, start->level);
 
-            if ((ngx_msec_int_t) wait > 0
-                && ctx->largest_ack - start->pnum < pkt_thr)
-            {
-                break;
+            if ((ngx_msec_int_t) wait > 0) {
+                if (ctx->largest_ack - start->pnum < pkt_thr) {
+                    break;
+                }
+
+                if ((ngx_msec_int_t) wait > (ngx_msec_int_t) margin) {
+                    break;
+                }
             }
 
             if ((ngx_msec_int_t) (start->send_time - qc->first_rtt) > 0) {
@@ -689,6 +721,9 @@ ngx_quic_detect_lost(ngx_connection_t *c, ngx_quic_ack_stat_t *st)
                 nlost++;
             }
 
+#if (NGX_DEBUG)
+            qc->counters.loss_declared++;
+#endif
             ngx_quic_resend_frames(c, ctx);
         }
     }
@@ -726,7 +761,7 @@ ngx_quic_pcg_duration(ngx_connection_t *c)
     qc = ngx_quic_get_connection(c);
 
     duration = qc->avg_rtt;
-    duration += ngx_max(4 * qc->rttvar, NGX_QUIC_TIME_GRANULARITY);
+    duration += ngx_quic_rttvar_margin(qc);
     duration += qc->peer_tp.max_ack_delay;
     duration *= NGX_QUIC_PERSISTENT_CONGESTION_THR;
 
@@ -1010,7 +1045,7 @@ ngx_quic_set_lost_timer(ngx_connection_t *c)
 {
     uint64_t                pkt_thr;
     ngx_uint_t              i;
-    ngx_msec_t              now;
+    ngx_msec_t              now, thr, margin;
     ngx_queue_t            *q;
     ngx_msec_int_t          lost, pto, w;
     ngx_quic_frame_t       *f;
@@ -1019,6 +1054,8 @@ ngx_quic_set_lost_timer(ngx_connection_t *c)
 
     qc = ngx_quic_get_connection(c);
     now = ngx_current_msec;
+    thr = ngx_quic_time_threshold(qc);
+    margin = ngx_quic_reorder_margin(qc, thr);
 
     lost = -1;
     pto = -1;
@@ -1033,14 +1070,28 @@ ngx_quic_set_lost_timer(ngx_connection_t *c)
         if (ctx->largest_ack != NGX_QUIC_UNSET_PN) {
             q = ngx_queue_head(&ctx->sent);
             f = ngx_queue_data(q, ngx_quic_frame_t, queue);
-            w = (ngx_msec_int_t)
-                            (f->send_time + ngx_quic_time_threshold(qc) - now);
+            w = (ngx_msec_int_t) (f->send_time + thr - now);
 
             if (f->pnum <= ctx->largest_ack) {
                 pkt_thr = ngx_quic_packet_threshold(ctx);
 
-                if (w < 0 || ctx->largest_ack - f->pnum >= pkt_thr) {
+                if (w < 0) {
                     w = 0;
+
+                } else if (ctx->largest_ack - f->pnum >= pkt_thr) {
+
+                    /*
+                     * gap-detected packets are declared lost margin ms
+                     * before the time threshold expires; fire the timer
+                     * at that instant, not at the full threshold
+                     */
+
+                    if (w <= (ngx_msec_int_t) margin) {
+                        w = 0;
+
+                    } else {
+                        w -= (ngx_msec_int_t) margin;
+                    }
                 }
 
                 if (lost == -1 || w < lost) {
@@ -1124,7 +1175,7 @@ ngx_quic_pto(ngx_connection_t *c, ngx_quic_send_ctx_t *ctx)
     /* RFC 9002, Appendix A.8.  Setting the Loss Detection Timer */
 
     duration = qc->avg_rtt;
-    duration += ngx_max(4 * qc->rttvar, NGX_QUIC_TIME_GRANULARITY);
+    duration += ngx_quic_rttvar_margin(qc);
 
     if (ctx->level == NGX_QUIC_ENCRYPTION_APPLICATION && c->ssl->handshaked) {
         duration += qc->peer_tp.max_ack_delay;
