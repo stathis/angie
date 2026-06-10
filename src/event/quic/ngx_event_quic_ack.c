@@ -45,6 +45,8 @@ typedef struct {
 
 static ngx_inline ngx_msec_t ngx_quic_rttvar_margin(
     ngx_quic_connection_t *qc);
+static ngx_inline ngx_msec_t ngx_quic_reorder_margin(
+    ngx_quic_connection_t *qc, ngx_msec_t thr);
 static ngx_inline ngx_msec_t ngx_quic_time_threshold(ngx_quic_connection_t *qc);
 static void ngx_quic_update_pacing(ngx_connection_t *c,
     ngx_uint_t in_slow_start);
@@ -79,6 +81,18 @@ ngx_quic_rttvar_margin(ngx_quic_connection_t *qc)
 {
     return ngx_max(NGX_QUIC_RTTVAR_MULTIPLIER * qc->rttvar,
                    NGX_QUIC_TIME_GRANULARITY);
+}
+
+
+/*
+ * jitter grace before the time threshold at which a packet meeting
+ * the packet threshold is declared lost; loss detection and the lost
+ * timer must agree on this value
+ */
+static ngx_inline ngx_msec_t
+ngx_quic_reorder_margin(ngx_quic_connection_t *qc, ngx_msec_t thr)
+{
+    return ngx_min(qc->rttvar, thr / 4);
 }
 
 
@@ -711,7 +725,7 @@ ngx_quic_detect_lost(ngx_connection_t *c, ngx_quic_ack_stat_t *st)
 {
     uint64_t                pkt_thr;
     ngx_uint_t              i, nlost;
-    ngx_msec_t              now, wait, thr, oldest, newest;
+    ngx_msec_t              now, wait, thr, margin, oldest, newest;
     ngx_queue_t            *q;
     ngx_quic_frame_t       *start;
     ngx_quic_send_ctx_t    *ctx;
@@ -720,6 +734,7 @@ ngx_quic_detect_lost(ngx_connection_t *c, ngx_quic_ack_stat_t *st)
     qc = ngx_quic_get_connection(c);
     now = ngx_current_msec;
     thr = ngx_quic_time_threshold(qc);
+    margin = ngx_quic_reorder_margin(qc, thr);
 
 #if (NGX_SUPPRESS_WARN)
     oldest = now;
@@ -758,9 +773,7 @@ ngx_quic_detect_lost(ngx_connection_t *c, ngx_quic_ack_stat_t *st)
                     break;
                 }
 
-                if ((ngx_msec_int_t) wait
-                    > (ngx_msec_int_t) ngx_min(qc->rttvar, thr / 4))
-                {
+                if ((ngx_msec_int_t) wait > (ngx_msec_int_t) margin) {
                     break;
                 }
             }
@@ -1364,7 +1377,7 @@ ngx_quic_set_lost_timer(ngx_connection_t *c)
 {
     uint64_t                pkt_thr;
     ngx_uint_t              i;
-    ngx_msec_t              now, thr;
+    ngx_msec_t              now, thr, margin;
     ngx_queue_t            *q;
     ngx_msec_int_t          lost, pto, w;
     ngx_quic_frame_t       *f;
@@ -1374,6 +1387,7 @@ ngx_quic_set_lost_timer(ngx_connection_t *c)
     qc = ngx_quic_get_connection(c);
     now = ngx_current_msec;
     thr = ngx_quic_time_threshold(qc);
+    margin = ngx_quic_reorder_margin(qc, thr);
 
     lost = -1;
     pto = -1;
@@ -1395,11 +1409,21 @@ ngx_quic_set_lost_timer(ngx_connection_t *c)
 
                 if (w < 0) {
                     w = 0;
-                } else if (ctx->largest_ack - f->pnum >= pkt_thr
-                           && w <= (ngx_msec_int_t)
-                              ngx_min(qc->rttvar, thr / 4))
-                {
-                    w = 0;
+
+                } else if (ctx->largest_ack - f->pnum >= pkt_thr) {
+
+                    /*
+                     * gap-detected packets are declared lost margin ms
+                     * before the time threshold expires; fire the timer
+                     * at that instant, not at the full threshold
+                     */
+
+                    if (w <= (ngx_msec_int_t) margin) {
+                        w = 0;
+
+                    } else {
+                        w -= (ngx_msec_int_t) margin;
+                    }
                 }
 
                 if (lost == -1 || w < lost) {
