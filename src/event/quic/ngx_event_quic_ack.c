@@ -911,6 +911,12 @@ ngx_quic_resend_frames(ngx_connection_t *c, ngx_quic_send_ctx_t *ctx)
 
         ngx_queue_remove(&f->queue);
 
+        /*
+         * the retransmission is a fresh send; without this, a frame once
+         * copied for a probe would be skipped by all future probe reclaims
+         */
+        f->reclaimed = 0;
+
         switch (f->type) {
         case NGX_QUIC_FT_ACK:
         case NGX_QUIC_FT_ACK_ECN:
