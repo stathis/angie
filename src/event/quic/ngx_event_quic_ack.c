@@ -1063,6 +1063,8 @@ ngx_quic_reclaim_for_probe(ngx_connection_t *c, ngx_quic_send_ctx_t *ctx,
                     return reclaimed;
                 }
 
+                data->next = NULL;
+
                 if (len > (size_t) (data->buf->end - data->buf->pos)) {
                     ngx_quic_free_chain(c, data);
                     ngx_quic_free_frame(c, nf);
@@ -1077,7 +1079,6 @@ ngx_quic_reclaim_for_probe(ngx_connection_t *c, ngx_quic_send_ctx_t *ctx,
                 }
 
                 data->buf->last = p;
-                data->next = NULL;
 
             } else {
                 data = NULL;
