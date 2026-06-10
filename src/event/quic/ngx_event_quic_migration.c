@@ -640,6 +640,17 @@ ngx_quic_discover_path_mtu(ngx_connection_t *c, ngx_quic_path_t *path)
         if (qc->conf->max_mtu > overhead) {
             limit = ngx_min(qc->conf->max_mtu - overhead, limit);
         }
+
+        /*
+         * RFC 9000, 14. Datagram Size: a path MTU below 1200 bytes
+         * must not be assumed; quic_max_mtu values just above 1200
+         * would otherwise yield a sub-minimum PLPMTU after the
+         * IP/UDP overhead is subtracted
+         */
+
+        if (limit < NGX_QUIC_MIN_INITIAL_SIZE) {
+            limit = NGX_QUIC_MIN_INITIAL_SIZE;
+        }
     }
 
     if (path->max_mtu) {
