@@ -320,7 +320,7 @@ static ngx_int_t
 ngx_quic_handle_ack_frame_range(ngx_connection_t *c, ngx_quic_send_ctx_t *ctx,
     uint64_t min, uint64_t max, ngx_quic_ack_stat_t *st)
 {
-    ngx_uint_t              found;
+    ngx_uint_t              found, found_large;
     ngx_queue_t            *q;
     ngx_quic_frame_t       *f;
     ngx_quic_connection_t  *qc;
@@ -335,6 +335,7 @@ ngx_quic_handle_ack_frame_range(ngx_connection_t *c, ngx_quic_send_ctx_t *ctx,
 
     st->max_pn = NGX_TIMER_INFINITE;
     found = 0;
+    found_large = 0;
 
     q = ngx_queue_head(&ctx->sent);
 
@@ -348,6 +349,10 @@ ngx_quic_handle_ack_frame_range(ngx_connection_t *c, ngx_quic_send_ctx_t *ctx,
         }
 
         if (f->pnum >= min) {
+            if (f->plen > NGX_QUIC_MIN_INITIAL_SIZE) {
+                found_large = 1;
+            }
+
             ngx_quic_congestion_ack(c, f);
 
             switch (f->type) {
@@ -422,7 +427,13 @@ ngx_quic_handle_ack_frame_range(ngx_connection_t *c, ngx_quic_send_ctx_t *ctx,
 
     qc->pto_count = 0;
 
-    if (ctx->level == NGX_QUIC_ENCRYPTION_APPLICATION) {
+    /*
+     * only an acknowledged packet larger than the minimum size proves
+     * that oversized packets traverse the path; acks of small packets
+     * must not mask an MTU black hole
+     */
+
+    if (ctx->level == NGX_QUIC_ENCRYPTION_APPLICATION && found_large) {
         qc->path->mtu_fails = 0;
     }
 
@@ -1195,6 +1206,7 @@ ngx_quic_mtu_blackhole_fallback(ngx_connection_t *c, ngx_msec_t now)
 static void
 ngx_quic_congestion_lost(ngx_connection_t *c, ngx_quic_frame_t *f)
 {
+    size_t                  plen;
     ngx_uint_t              blocked;
     ngx_msec_t              now, timer;
     ngx_quic_path_t        *path;
@@ -1214,6 +1226,7 @@ ngx_quic_congestion_lost(ngx_connection_t *c, ngx_quic_frame_t *f)
 
     blocked = (cg->in_flight >= cg->window) ? 1 : 0;
 
+    plen = f->plen;
     cg->in_flight -= f->plen;
     f->plen = 0;
 
@@ -1249,10 +1262,13 @@ ngx_quic_congestion_lost(ngx_connection_t *c, ngx_quic_frame_t *f)
      * Burst losses within a single epoch reach here only once (the rest
      * hit timer <= 0 and goto done above), so no dedup logic is needed.
      * A real black-hole causes persistent failures across many epochs.
+     * Only losses of oversized packets are evidence of a black hole;
+     * small-packet losses are ordinary congestion.
      */
 
     if (f->level == NGX_QUIC_ENCRYPTION_APPLICATION
-        && path->mtu > NGX_QUIC_MIN_INITIAL_SIZE)
+        && path->mtu > NGX_QUIC_MIN_INITIAL_SIZE
+        && plen > NGX_QUIC_MIN_INITIAL_SIZE)
     {
         path->mtu_fails++;
 
