@@ -125,7 +125,7 @@ ngx_quic_create_datagrams(ngx_connection_t *c)
     uint64_t                preserved_pnum[NGX_QUIC_SEND_CTX_LAST];
     uint64_t                now_us;
     ngx_uint_t              i, pad, allow_probe, ack_eliciting;
-    ngx_uint_t              has_probe, probe_mask;
+    ngx_uint_t              has_probe, probe_mask, ack_only;
     ngx_msec_t              wait_ms;
     ngx_quic_path_t        *path;
     ngx_quic_send_ctx_t    *ctx;
@@ -155,6 +155,8 @@ ngx_quic_create_datagrams(ngx_connection_t *c)
     now_us = ngx_quic_current_usec();
 
     do {
+        ack_only = 0;
+
         /* interval-based pacing check (microsecond precision) */
         if (cg->pacing_interval > 0 && cg->pacing_next > now_us) {
             if (!has_probe) {
@@ -170,7 +172,23 @@ ngx_quic_create_datagrams(ngx_connection_t *c)
 #if (NGX_DEBUG)
                 qc->counters.pacing_deferrals++;
 #endif
-                break;
+
+                /*
+                 * RFC 9002, 7. ACK-only packets are not congestion
+                 * controlled; flush pending acknowledgments in a final
+                 * ack-only pass instead of deferring them with the data
+                 */
+
+                for (i = 0; i < NGX_QUIC_SEND_CTX_LAST; i++) {
+                    if (qc->send_ctx[i].send_ack) {
+                        ack_only = 1;
+                        break;
+                    }
+                }
+
+                if (!ack_only) {
+                    break;
+                }
             }
         }
 
@@ -213,8 +231,9 @@ ngx_quic_create_datagrams(ngx_connection_t *c)
             ack_eliciting = 0;
 
             n = ngx_quic_output_packet(c, ctx, p, len, min,
-                                       cg->in_flight >= window
-                                       && !allow_probe,
+                                       ack_only
+                                       || (cg->in_flight >= window
+                                           && !allow_probe),
                                        &ack_eliciting);
             if (n == NGX_ERROR) {
                 return NGX_ERROR;
@@ -265,6 +284,11 @@ ngx_quic_create_datagrams(ngx_connection_t *c)
         }
 
         path->sent += len;
+
+        if (ack_only) {
+            /* the pacing timer is already set; acknowledgments are out */
+            break;
+        }
 
         /* pacing: track bytes sent, enforce burst limit (probes exempt) */
         if (cg->pacing_interval > 0 && !probe_mask && !has_probe) {
