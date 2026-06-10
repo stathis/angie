@@ -26,6 +26,9 @@
 
 #define NGX_QUIC_SEND_CTX_LAST               (NGX_QUIC_ENCRYPTION_LAST - 1)
 
+/* tracked declared-lost packet numbers per context (spurious loss undo) */
+#define NGX_QUIC_LOST_TRACK                  32
+
 
 typedef struct ngx_quic_connection_s  ngx_quic_connection_t;
 typedef struct ngx_quic_server_id_s   ngx_quic_server_id_t;
@@ -198,6 +201,21 @@ typedef struct {
     uint64_t                          pacing_interval;  /* microseconds */
     uint64_t                          pacing_next;      /* microseconds */
     ngx_msec_t                        pacing_time;
+
+    /*
+     * pre-decrease state of the most recent recovery epoch, restored
+     * when a packet declared lost turns out to have been delivered
+     */
+    ngx_uint_t                        undo_valid;
+                                                 /* unsigned undo_valid:1 */
+    ngx_msec_t                        undo_epoch;
+    size_t                            undo_window;
+    size_t                            undo_ssthresh;
+    size_t                            undo_w_max;
+    size_t                            undo_w_est;
+    ngx_msec_t                        undo_k;
+    ngx_msec_t                        undo_recovery_start;
+    ngx_msec_t                        undo_idle_start;
 } ngx_quic_congestion_t;
 
 
@@ -207,6 +225,7 @@ typedef struct {
     ngx_uint_t                        reclaimed_frames;
     ngx_uint_t                        ping_probes;
     ngx_uint_t                        spurious_loss_suspects;
+    ngx_uint_t                        spurious_loss_undone;
     ngx_uint_t                        pacing_deferrals;
     ngx_uint_t                        burst_cap_hits;
     ngx_uint_t                        mtu_blackhole_detected;
@@ -245,6 +264,12 @@ struct ngx_quic_send_ctx_s {
     ngx_quic_ack_range_t              ranges[NGX_QUIC_MAX_RANGES];
     ngx_uint_t                        send_ack;
     ngx_uint_t                        probe_pending;
+
+    /* recently declared-lost packet numbers awaiting late delivery proof */
+    uint64_t                          lost_pnum[NGX_QUIC_LOST_TRACK];
+    ngx_msec_t                        lost_epoch[NGX_QUIC_LOST_TRACK];
+    ngx_uint_t                        lost_len;
+    ngx_uint_t                        lost_next;   /* overwrite slot if full */
 };
 
 

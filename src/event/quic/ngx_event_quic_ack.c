@@ -74,6 +74,10 @@ static ngx_int_t ngx_quic_ping_peer(ngx_connection_t *c,
 static void ngx_quic_lost_handler(ngx_event_t *ev);
 static ngx_uint_t ngx_quic_reclaim_for_probe(ngx_connection_t *c,
     ngx_quic_send_ctx_t *ctx, ngx_uint_t num);
+static void ngx_quic_lost_record(ngx_connection_t *c,
+    ngx_quic_send_ctx_t *ctx, uint64_t pnum);
+static void ngx_quic_lost_undo_check(ngx_connection_t *c,
+    ngx_quic_send_ctx_t *ctx, uint64_t min, uint64_t max);
 
 
 static ngx_inline ngx_msec_t
@@ -345,6 +349,10 @@ ngx_quic_handle_ack_frame_range(ngx_connection_t *c, ngx_quic_send_ctx_t *ctx,
         if (ngx_quic_handle_path_mtu(c, qc->path, min, max) != NGX_OK) {
             return NGX_ERROR;
         }
+    }
+
+    if (ctx->lost_len) {
+        ngx_quic_lost_undo_check(c, ctx, min, max);
     }
 
     st->max_pn = NGX_TIMER_INFINITE;
@@ -723,7 +731,7 @@ ngx_quic_drop_ack_ranges(ngx_connection_t *c, ngx_quic_send_ctx_t *ctx,
 static ngx_int_t
 ngx_quic_detect_lost(ngx_connection_t *c, ngx_quic_ack_stat_t *st)
 {
-    uint64_t                pkt_thr;
+    uint64_t                pkt_thr, pnum;
     ngx_uint_t              i, nlost;
     ngx_msec_t              now, wait, thr, margin, oldest, newest;
     ngx_queue_t            *q;
@@ -798,7 +806,12 @@ ngx_quic_detect_lost(ngx_connection_t *c, ngx_quic_ack_stat_t *st)
 #if (NGX_DEBUG)
             qc->counters.loss_declared++;
 #endif
+            pnum = start->pnum;
+
             ngx_quic_resend_frames(c, ctx);
+
+            /* after resend: the entry is stamped with this loss's epoch */
+            ngx_quic_lost_record(c, ctx, pnum);
         }
     }
 
@@ -823,6 +836,93 @@ ngx_quic_detect_lost(ngx_connection_t *c, ngx_quic_ack_stat_t *st)
     ngx_quic_set_lost_timer(c);
 
     return NGX_OK;
+}
+
+
+static void
+ngx_quic_lost_record(ngx_connection_t *c, ngx_quic_send_ctx_t *ctx,
+    uint64_t pnum)
+{
+    ngx_uint_t              slot;
+    ngx_quic_connection_t  *qc;
+
+    qc = ngx_quic_get_connection(c);
+
+    if (ctx->lost_len < NGX_QUIC_LOST_TRACK) {
+        slot = ctx->lost_len++;
+
+    } else {
+        slot = ctx->lost_next++ % NGX_QUIC_LOST_TRACK;
+    }
+
+    ctx->lost_pnum[slot] = pnum;
+    ctx->lost_epoch[slot] = qc->congestion.recovery_start;
+}
+
+
+/*
+ * a packet number is never reused, so an acknowledgment covering a packet
+ * declared lost proves the original was delivered and the loss declaration
+ * was spurious; revert the congestion decrease of its recovery epoch
+ */
+
+static void
+ngx_quic_lost_undo_check(ngx_connection_t *c, ngx_quic_send_ctx_t *ctx,
+    uint64_t min, uint64_t max)
+{
+    ngx_uint_t              i, undo;
+    ngx_quic_congestion_t  *cg;
+    ngx_quic_connection_t  *qc;
+
+    qc = ngx_quic_get_connection(c);
+    cg = &qc->congestion;
+
+    undo = 0;
+
+    for (i = 0; i < ctx->lost_len; /* void */ ) {
+
+        if (ctx->lost_pnum[i] < min || ctx->lost_pnum[i] > max) {
+            i++;
+            continue;
+        }
+
+        if (cg->undo_valid && ctx->lost_epoch[i] == cg->undo_epoch) {
+            undo = 1;
+        }
+
+        /* remove: swap with last entry */
+        ctx->lost_len--;
+        ctx->lost_pnum[i] = ctx->lost_pnum[ctx->lost_len];
+        ctx->lost_epoch[i] = ctx->lost_epoch[ctx->lost_len];
+    }
+
+    if (!undo) {
+        return;
+    }
+
+    ngx_log_debug2(NGX_LOG_DEBUG_EVENT, c->log, 0,
+                   "quic spurious loss undo win:%uz -> %uz",
+                   cg->window, cg->undo_window);
+
+    cg->window = cg->undo_window;
+    cg->ssthresh = cg->undo_ssthresh;
+    cg->w_max = cg->undo_w_max;
+    cg->w_est = cg->undo_w_est;
+    cg->k = cg->undo_k;
+    cg->recovery_start = cg->undo_recovery_start;
+    cg->idle_start = cg->undo_idle_start;
+
+    cg->undo_valid = 0;
+
+    ngx_quic_update_pacing(c, cg->window <= cg->ssthresh);
+
+#if (NGX_DEBUG)
+    qc->counters.spurious_loss_undone++;
+#endif
+
+    if (cg->in_flight < cg->window && !qc->push.timer_set) {
+        ngx_post_event(&qc->push, &ngx_posted_events);
+    }
 }
 
 
@@ -855,6 +955,9 @@ ngx_quic_persistent_congestion(ngx_connection_t *c)
     cg->mtu = qc->path->mtu;
     cg->recovery_start = ngx_quic_oldest_sent_packet(c) - 1;
     cg->window = cg->mtu * 2;
+
+    /* the collapse is deliberate; never restore the pre-collapse window */
+    cg->undo_valid = 0;
 
     ngx_quic_update_pacing(c, 1);
 
@@ -1211,6 +1314,9 @@ ngx_quic_mtu_blackhole_fallback(ngx_connection_t *c, ngx_msec_t now)
 
     cg->mtu = NGX_QUIC_MIN_INITIAL_SIZE;
 
+    /* the fallback window reflects the new MTU; do not restore the old one */
+    cg->undo_valid = 0;
+
     /* schedule PMTUD re-probe after cooldown */
     path->mtud = 0;
     path->state = NGX_QUIC_PATH_WAITING;
@@ -1273,6 +1379,17 @@ ngx_quic_congestion_lost(ngx_connection_t *c, ngx_quic_frame_t *f)
     }
 
     /* RFC 9438, 4.6. Multiplicative Decrease */
+
+    /* save pre-decrease state; restored if this loss proves spurious */
+    cg->undo_valid = 1;
+    cg->undo_epoch = now;
+    cg->undo_window = cg->window;
+    cg->undo_ssthresh = cg->ssthresh;
+    cg->undo_w_max = cg->w_max;
+    cg->undo_w_est = cg->w_est;
+    cg->undo_k = cg->k;
+    cg->undo_recovery_start = cg->recovery_start;
+    cg->undo_idle_start = cg->idle_start;
 
     cg->mtu = qc->path->mtu;
     cg->recovery_start = now;
