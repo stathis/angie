@@ -1572,35 +1572,6 @@ ngx_quic_pto_handler(ngx_event_t *ev)
         return;
     }
 
-    /* PING fallback for remaining probes (no data available) */
-    for (i = 0; i < NGX_QUIC_SEND_CTX_LAST; i++) {
-        ctx = &qc->send_ctx[i];
-
-        while (ctx->probe_pending > 0) {
-
-            f = ngx_quic_alloc_frame(c);
-            if (f == NULL) {
-                ngx_quic_close_connection(c, NGX_ERROR);
-                return;
-            }
-
-            f->level = ctx->level;
-            f->type = NGX_QUIC_FT_PING;
-            f->ignore_congestion = 1;
-
-            if (ngx_quic_frame_sendto(c, f, 0, qc->path) != NGX_OK) {
-                ngx_quic_close_connection(c, NGX_ERROR);
-                return;
-            }
-
-#if (NGX_DEBUG)
-            qc->counters.ping_probes++;
-#endif
-            ctx->probe_pending--;
-        }
-    }
-
-
     /*
      * RFC 9002  6.2.2.1  Before Address Validation
      *
@@ -1681,6 +1652,39 @@ ngx_quic_pto_handler(ngx_event_t *ev)
         if (ngx_quic_output(c) != NGX_OK) {
             ngx_quic_close_connection(c, NGX_ERROR);
             return;
+        }
+    }
+
+    /*
+     * PING fallback for remaining probes (no data available);
+     * runs last so that probe credit granted above cannot outlive
+     * the handler and bypass pacing and congestion limits later
+     */
+
+    for (i = 0; i < NGX_QUIC_SEND_CTX_LAST; i++) {
+        ctx = &qc->send_ctx[i];
+
+        while (ctx->probe_pending > 0) {
+
+            f = ngx_quic_alloc_frame(c);
+            if (f == NULL) {
+                ngx_quic_close_connection(c, NGX_ERROR);
+                return;
+            }
+
+            f->level = ctx->level;
+            f->type = NGX_QUIC_FT_PING;
+            f->ignore_congestion = 1;
+
+            if (ngx_quic_frame_sendto(c, f, 0, qc->path) != NGX_OK) {
+                ngx_quic_close_connection(c, NGX_ERROR);
+                return;
+            }
+
+#if (NGX_DEBUG)
+            qc->counters.ping_probes++;
+#endif
+            ctx->probe_pending--;
         }
     }
 
