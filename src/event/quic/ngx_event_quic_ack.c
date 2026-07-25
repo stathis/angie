@@ -632,9 +632,7 @@ ngx_quic_congestion_reset(ngx_quic_connection_t *qc)
 {
     ngx_memzero(&qc->congestion, sizeof(ngx_quic_congestion_t));
 
-    qc->congestion.window = ngx_min(10 * NGX_QUIC_MIN_INITIAL_SIZE,
-                                    ngx_max(2 * NGX_QUIC_MIN_INITIAL_SIZE,
-                                            14720));
+    qc->congestion.window = ngx_quic_initial_cwnd(qc);
     qc->congestion.ssthresh = (size_t) -1;
     qc->congestion.mtu = NGX_QUIC_MIN_INITIAL_SIZE;
     qc->congestion.recovery_start = ngx_current_msec -1;

@@ -377,6 +377,19 @@ struct ngx_quic_connection_s {
 };
 
 
+/* RFC 9002, 7.2. Initial and Minimum Congestion Window */
+static ngx_inline size_t
+ngx_quic_initial_cwnd(ngx_quic_connection_t *qc)
+{
+    if (qc->conf->initial_cwnd) {
+        return qc->conf->initial_cwnd;
+    }
+
+    return ngx_min(10 * NGX_QUIC_MIN_INITIAL_SIZE,
+                   ngx_max(2 * NGX_QUIC_MIN_INITIAL_SIZE, 14720));
+}
+
+
 ngx_int_t ngx_quic_apply_transport_params(ngx_connection_t *c,
     ngx_quic_tp_t *peer_tp);
 void ngx_quic_discard_ctx(ngx_connection_t *c, ngx_uint_t level);

@@ -99,6 +99,13 @@ static ngx_command_t  ngx_http_v3_commands[] = {
       offsetof(ngx_http_v3_srv_conf_t, quic.max_mtu),
       NULL },
 
+    { ngx_string("quic_initial_cwnd"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_size_slot,
+      NGX_HTTP_SRV_CONF_OFFSET,
+      offsetof(ngx_http_v3_srv_conf_t, quic.initial_cwnd),
+      NULL },
+
       ngx_null_command
 };
 
@@ -261,6 +268,7 @@ ngx_http_v3_create_srv_conf(ngx_conf_t *cf)
 
     h3scf->quic.stream_buffer_size = NGX_CONF_UNSET_SIZE;
     h3scf->quic.max_mtu = NGX_CONF_UNSET_SIZE;
+    h3scf->quic.initial_cwnd = NGX_CONF_UNSET_SIZE;
     h3scf->quic.max_concurrent_streams_bidi = NGX_CONF_UNSET_UINT;
     h3scf->quic.max_concurrent_streams_uni = NGX_HTTP_V3_MAX_UNI_STREAMS;
     h3scf->quic.retry = NGX_CONF_UNSET;
@@ -315,6 +323,20 @@ ngx_http_v3_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                            "\"quic_max_mtu\" must be 0 or at least %d",
                            NGX_QUIC_MIN_INITIAL_SIZE);
+        return NGX_CONF_ERROR;
+    }
+
+    /* 0 means the RFC 9002 default: min(10 * 1200, max(2 * 1200, 14720)) */
+    ngx_conf_merge_size_value(conf->quic.initial_cwnd,
+                              prev->quic.initial_cwnd,
+                              0);
+
+    if (conf->quic.initial_cwnd != 0
+        && conf->quic.initial_cwnd < 2 * NGX_QUIC_MIN_INITIAL_SIZE)
+    {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "\"quic_initial_cwnd\" must be 0 or at least %d",
+                           2 * NGX_QUIC_MIN_INITIAL_SIZE);
         return NGX_CONF_ERROR;
     }
 

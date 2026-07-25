@@ -94,6 +94,7 @@ struct ngx_quic_conf_s {
     ngx_str_t                      host_key;
     size_t                         stream_buffer_size;
     size_t                         max_mtu;
+    size_t                         initial_cwnd;
     ngx_uint_t                     max_concurrent_streams_bidi;
     ngx_uint_t                     max_concurrent_streams_uni;
     ngx_uint_t                     active_connection_id_limit;
